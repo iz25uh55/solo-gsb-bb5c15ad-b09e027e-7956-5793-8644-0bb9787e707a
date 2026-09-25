@@ -759,5 +759,110 @@ class TrailerPlanApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class PlaybackPlanApiTests(unittest.TestCase):
+    # 块 0：A 词 0、1（0～1000ms）；块间静音 500ms；块 1：B 词 2（1500～2500ms）
+    WORDS = [
+        {"start_ms": 0, "end_ms": 600, "text": "甲", "speaker": "A"},
+        {"start_ms": 600, "end_ms": 1000, "text": "乙", "speaker": "A"},
+        {"start_ms": 1500, "end_ms": 2500, "text": "丙", "speaker": "B"},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "target_ms": 3000}
+        payload.update(overrides)
+        return self.client.post("/playback-plan", json=payload)
+
+    def test_basic_playback_plan(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["total_original_ms"], 2500)
+        self.assertEqual(data["total_duration_ms"], 2500)
+        self.assertEqual(
+            data["blocks"],
+            [
+                {
+                    "index": 0,
+                    "speaker": "A",
+                    "start_word": 0,
+                    "end_word": 1,
+                    "original_start_ms": 0,
+                    "original_end_ms": 1000,
+                    "original_duration_ms": 1000,
+                    "speed_percent": 100,
+                    "playback_duration_ms": 1000,
+                    "playback_start_ms": 0,
+                    "playback_end_ms": 1000,
+                },
+                {
+                    "index": 1,
+                    "speaker": "B",
+                    "start_word": 2,
+                    "end_word": 2,
+                    "original_start_ms": 1500,
+                    "original_end_ms": 2500,
+                    "original_duration_ms": 1000,
+                    "speed_percent": 100,
+                    "playback_duration_ms": 1000,
+                    "playback_start_ms": 1500,
+                    "playback_end_ms": 2500,
+                },
+            ],
+        )
+
+    def test_speedup_and_lex_tie(self):
+        # 目标 2099（预算 1599）：(125,150) 与 (150,125) 同代价同长度，
+        # 字典序取前者
+        resp = self.post(target_ms=2099)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual([b["speed_percent"] for b in data["blocks"]], [125, 150])
+        self.assertEqual(data["total_duration_ms"], 1967)
+
+    def test_infeasible_returns_422(self):
+        resp = self.post(target_ms=1833)  # 下限为 1834（静音 500 + 667×2）
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_playback_plan")
+        self.assertEqual(err["block_count"], 2)
+        self.assertEqual(err["target_ms"], 1833)
+        self.assertEqual(err["minimum_duration_ms"], 1834)
+
+    def test_too_many_chunks_returns_422(self):
+        words = [
+            {"start_ms": i * 100, "end_ms": i * 100 + 100, "text": "字", "speaker": s}
+            for i, s in enumerate("AB" * 10 + "A")  # 21 个说话人区间
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "too_many_playback_chunks")
+        self.assertEqual(err["block_count"], 21)
+        self.assertEqual(err["max_blocks"], 20)
+
+    def test_target_schema_invalid(self):
+        # 负数、None 与非数字字符串均为 422（注：纯数字字符串会被
+        # Pydantic 强制转换为整数，属于 FastAPI 标准行为，故不列入）
+        for bad in (-1, None, "abc", [1000], {"ms": 1000}):
+            resp = self.post(target_ms=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0]), dict(self.WORDS[2])]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()

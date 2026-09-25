@@ -1,7 +1,8 @@
 """FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点、
 POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐、
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
-遮罩预览、POST /trailer-plan 预告片片段组合服务。"""
+遮罩预览、POST /trailer-plan 预告片片段组合、POST /playback-plan 倍速
+播放方案服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -11,6 +12,7 @@ from .ad_breaks import optimal_ad_breaks
 from .chapter_align import align_chapters
 from .duplicate_passages import find_duplicate_passages
 from .errors import DomainError
+from .playback_plan import plan_playback
 from .redact_preview import redact_preview
 from .schemas import (
     AdBreakRequest,
@@ -19,6 +21,8 @@ from .schemas import (
     ChapterAlignResponse,
     DuplicatePassagesRequest,
     DuplicatePassagesResponse,
+    PlaybackPlanRequest,
+    PlaybackPlanResponse,
     RedactPreviewRequest,
     RedactPreviewResponse,
     SegmentRequest,
@@ -40,8 +44,10 @@ app = FastAPI(
     "按章节 cue 文本命中把章节对齐到词时间轴，"
     "检测词序列完全相同的重复口播片段，"
     "对命中敏感短语的字符生成逐字遮罩预览，"
-    "并在词区间不重叠与时长预算约束下组合必选说话人全覆盖的预告片片段。",
-    version="1.6.0",
+    "在词区间不重叠与时长预算约束下组合必选说话人全覆盖的预告片片段，"
+    "并把同一说话人连续词合为语速块，在最长播放时长约束下选取代价最小"
+    "的倍速播放方案。",
+    version="1.7.0",
 )
 
 
@@ -71,7 +77,8 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "/redact-preview 另需 phrases 为 1～50 个非空字符串，"
         "且 words 至多 2000 个；/trailer-plan 另需 1～20 个 candidates"
         "（每项含整数 start_word/end_word 与非负整数 score）、非负整数 "
-        "budget_ms 与 1～3 个非空 required_speakers",
+        "budget_ms 与 1～3 个非空 required_speakers；/playback-plan 另需"
+        "非负整数 target_ms",
         {"errors": exc.errors()},
     )
 
@@ -157,5 +164,18 @@ async def create_trailer_plan(request: TrailerPlanRequest):
     return TrailerPlanResponse(
         clips=clips,
         total_score=total_score,
+        total_duration_ms=total_duration_ms,
+    )
+
+
+@app.post("/playback-plan", response_model=PlaybackPlanResponse)
+async def create_playback_plan(request: PlaybackPlanRequest):
+    blocks, total_duration_ms, total_original_ms = plan_playback(
+        request.words,
+        request.target_ms,
+    )
+    return PlaybackPlanResponse(
+        blocks=blocks,
+        total_original_ms=total_original_ms,
         total_duration_ms=total_duration_ms,
     )

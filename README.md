@@ -6,8 +6,10 @@
 以最小代价重指派说话人，**章节时刻对齐**接口，按章节 cue 文本在同一说话人
 连续词中的命中把章节锚定到词时间轴，**重复口播片段**接口，检测词序列
 完全相同的两处口播片段，**敏感短语遮罩预览**接口，把命中敏感短语的字符
-逐字替换为 `█` 并回报每处命中位置，以及**预告片片段组合**接口，在词区间
-互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合。
+逐字替换为 `█` 并回报每处命中位置，**预告片片段组合**接口，在词区间
+互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合，
+以及**倍速播放方案**接口，把同一说话人连续词合为语速块，在目标最长播放
+时长约束下选取代价最小、同代价播放最长、再按语速序列字典序裁决的倍速方案。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -26,6 +28,7 @@ docker compose up --build
 - 重复口播片段接口：`POST http://localhost:8000/duplicate-passages`
 - 敏感短语遮罩预览接口：`POST http://localhost:8000/redact-preview`
 - 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
+- 倍速播放方案接口：`POST http://localhost:8000/playback-plan`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -669,13 +672,125 @@ curl -s http://localhost:8000/trailer-plan \
 }
 ```
 
+## 倍速播放方案：`POST /playback-plan`
+
+按现有 `words` 时间规则接收有序词序列，把**连续同一说话人的词合为语速块**
+（说话人变化处强制分块，至多 **20** 块）。每块从 **100%、125%、150%** 三档
+语速中选一档：**块内首词 `start_ms` 至末词 `end_ms` 整段变速**（块内词间
+停顿一并等比压缩），**块间静音保持原时长**。请求给出目标最长播放总时长
+`target_ms`，服务在总播放时长不超过目标的前提下求最优语速组合。`words`
+字段与 `/segments` 完全相同，并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/playback-plan`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 500,  "text": "大家",   "speaker": "A"},
+    {"start_ms": 500,  "end_ms": 1000, "text": "好",     "speaker": "A"},
+    {"start_ms": 1500, "end_ms": 2500, "text": "下期再见", "speaker": "B"}
+  ],
+  "target_ms": 2300
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `target_ms` | 非负整数 | 目标最长播放总时长（毫秒）；块间静音不可压缩，目标短于其下限即无解 |
+
+### 变速与代价规则
+
+1. **分块**：同一说话人的连续词合并为一块，块原时长 = 块末词 `end_ms` −
+   块首词 `start_ms`（整段，含块内词间停顿）；说话人切换处的词间停顿为
+   **块间静音**，播放时保持原时长、首尾相接，不计入任何一块；
+2. **块播放时长**：`ceil(原时长 × 100 / 语速)`，向上取整（毫秒）；
+3. **播放总时长**：`Σ 块播放时长 + Σ 块间静音`，要求 `<= target_ms`；
+4. **目标**：最小化变速代价
+   `Σ 原时长 × (语速 − 100)²`——100% 代价 0、125% 每毫秒代价 625、
+   150% 每毫秒代价 2500；
+5. **同分裁决**：同代价取**播放总时长最长**者（块间静音为常量，等价于
+   各块播放时长之和最长）；再取**语速序列字典序最小**者（按块顺序逐位比较
+   语速数值，100 < 125 < 150）；
+6. 同一说话人连续区间超过 **20** 块时返回 422（`too_many_playback_chunks`）；
+   全程 150% 仍无法满足目标时返回 422（`infeasible_playback_plan`）。
+
+### 响应示例（200）
+
+```json
+{
+  "blocks": [
+    {
+      "index": 0,
+      "speaker": "A",
+      "start_word": 0,
+      "end_word": 1,
+      "original_start_ms": 0,
+      "original_end_ms": 1000,
+      "original_duration_ms": 1000,
+      "speed_percent": 100,
+      "playback_duration_ms": 1000,
+      "playback_start_ms": 0,
+      "playback_end_ms": 1000
+    },
+    {
+      "index": 1,
+      "speaker": "B",
+      "start_word": 2,
+      "end_word": 2,
+      "original_start_ms": 1500,
+      "original_end_ms": 2500,
+      "original_duration_ms": 1000,
+      "speed_percent": 125,
+      "playback_duration_ms": 800,
+      "playback_start_ms": 1500,
+      "playback_end_ms": 2300
+    }
+  ],
+  "total_original_ms": 2500,
+  "total_duration_ms": 2300
+}
+```
+
+> 两块原时长均为 1000ms，块间静音 500ms（词 1 `end_ms=1000` 到词 2
+> `start_ms=1500`），故块播放时长预算为 `2300 − 500 = 1800`。方案
+> `(100%, 125%)` 块播放 `1000 + 800 = 1800`，代价 625,000；`(125%, 100%)`
+> 代价相同、总时长相同，按语速序列字典序取 `(100%, 125%)`。播放时刻从 0
+> 起累加：块 0 占 0～1000，静音保持 500，块 1 占 1500～2300。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/playback-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":500,"text":"大家","speaker":"A"},{"start_ms":500,"end_ms":1000,"text":"好","speaker":"A"},{"start_ms":1500,"end_ms":2500,"text":"下期再见","speaker":"B"}],"target_ms":2300}'
+```
+
+### 无可行方案
+
+即使所有块都取 150%（块间静音不可压缩），播放总时长仍超过 `target_ms` 时，
+返回 422，并附带块数、目标值与理论最小时长：
+
+```json
+{
+  "error": {
+    "code": "infeasible_playback_plan",
+    "message": "不存在总播放时长不超过目标的语速方案",
+    "block_count": 2,
+    "target_ms": 1833,
+    "minimum_duration_ms": 1834
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`target_ms` 为负） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -689,6 +804,8 @@ curl -s http://localhost:8000/trailer-plan \
 | `candidate_range_inverted` | 预告片候选 `start_word > end_word` | `candidate_index` |
 | `candidate_speaker_mixed` | 预告片候选词区间横跨多个说话人 | `candidate_index` |
 | `infeasible_trailer_plan` | 不存在满足全部约束的预告片片段组合 | `candidate_count`、`budget_ms` |
+| `too_many_playback_chunks` | 同一说话人连续区间（语速块）超过 20 块 | `block_count`、`max_blocks` |
+| `infeasible_playback_plan` | 全程 150% 仍无法把播放总时长压到 `target_ms` 以内 | `block_count`、`target_ms`、`minimum_duration_ms` |
 
 ### 无可行分段
 
@@ -780,6 +897,19 @@ O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符�
 被选候选，余项恰落在下一状态前沿内即可行，每步取原候选序号最小者，归纳可得
 时间顺序候选序号序列的字典序最小者。
 
+倍速播放方案（`playback_plan.py`）为折半枚举（Meet-in-the-Middle）+
+支配前沿二分 + 贪心重建，**O(3^⌈k/2⌉·k) 时间/空间**（k 为语速块数 ≤ 20，
+每半至多 3¹⁰ ≈ 5.9 万个组合，与原时长量级无关）。块间静音之和为常量，
+预算先扣除静音；块播放时长 `ceil(原时长×100/语速)`、代价
+`原时长×(语速−100)²`。全程 100% 已满足目标时直接直出（代价 0 且字典序
+最小），全程 150% 仍超预算则无解。否则在块序列中点折半枚举两半的全部
+（代价, 播放时长）组合：右半按代价聚合并剪为“代价升序、最小播放时长
+严格递减”的支配前沿，对每个左半点二分求播放时长不超剩余预算的最小右半
+代价，即得可行最小代价 C\*；再在总价恰为 C\* 的配对中取播放时长之和
+最大者 W\*。重建阶段把每个后缀起点的左尾/右尾点表增量预建为
+（代价, 播放时长）元组集合，逐块按 100%→125%→150% 试档，集合直查是否
+存在恰好补到 (C\*, W\*) 且不超预算的配对，归纳可得语速序列字典序最小。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -808,6 +938,7 @@ app/
   duplicate_passages.py # 重复口播片段检测（纯标准库，复用同一套输入校验）
   redact_preview.py     # 敏感短语遮罩预览（纯标准库，复用同一套输入校验）
   trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
+  playback_plan.py      # 倍速播放方案（纯标准库，复用同一套输入校验）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -818,6 +949,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_duplicate_passages.py
   test_redact_preview.py
   test_trailer_plan.py
+  test_playback_plan.py
   test_differential.py
   test_api.py
 Dockerfile

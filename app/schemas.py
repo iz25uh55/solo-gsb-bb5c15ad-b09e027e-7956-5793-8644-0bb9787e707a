@@ -226,3 +226,48 @@ class TrailerPlanResponse(BaseModel):
     total_duration_ms: int = Field(
         ..., description="选中片段的总时长（同分时最小化；不超过 budget_ms）"
     )
+
+
+class PlaybackPlanRequest(BaseModel):
+    words: list[WordIn] = Field(..., min_length=1, description="按时间排列的词序列")
+    target_ms: int = Field(
+        ..., ge=0, description="目标最长播放总时长（毫秒，非负整数）"
+    )
+
+
+class PlaybackBlockOut(BaseModel):
+    index: int
+    speaker: str = Field(..., description="块说话人：同一说话人连续词合并为一块")
+    start_word: int = Field(..., description="块首词序号（0-based，含）")
+    end_word: int = Field(..., description="块末词序号（0-based，含）")
+    original_start_ms: int = Field(..., description="原始起点：块首词 start_ms")
+    original_end_ms: int = Field(..., description="原始终点：块末词 end_ms")
+    original_duration_ms: int = Field(
+        ..., description="原时长：original_end_ms - original_start_ms"
+    )
+    speed_percent: int = Field(
+        ..., description="选中语速：100、125 或 150（百分比）"
+    )
+    playback_duration_ms: int = Field(
+        ...,
+        description="块播放时长：ceil(original_duration_ms × 100 / speed_percent)",
+    )
+    playback_start_ms: int = Field(
+        ..., description="播放时刻起点：从 0 起按块播放时长与块间静音累加"
+    )
+    playback_end_ms: int = Field(
+        ..., description="播放时刻终点：playback_start_ms + playback_duration_ms"
+    )
+
+
+class PlaybackPlanResponse(BaseModel):
+    blocks: list[PlaybackBlockOut] = Field(
+        ..., description="按时间顺序的语速块（至多 20 块）"
+    )
+    total_original_ms: int = Field(
+        ...,
+        description="原片时长：首词 start_ms 到末词 end_ms（含块间静音）",
+    )
+    total_duration_ms: int = Field(
+        ..., description="播放总时长（块间静音保持原时长；不超过 target_ms）"
+    )
