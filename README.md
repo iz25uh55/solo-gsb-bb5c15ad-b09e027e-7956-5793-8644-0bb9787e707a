@@ -6,8 +6,10 @@
 以最小代价重指派说话人，**章节时刻对齐**接口，按章节 cue 文本在同一说话人
 连续词中的命中把章节锚定到词时间轴，**重复口播片段**接口，检测词序列
 完全相同的两处口播片段，**敏感短语遮罩预览**接口，把命中敏感短语的字符
-逐字替换为 `█` 并回报每处命中位置，以及**预告片片段组合**接口，在词区间
-互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合。
+逐字替换为 `█` 并回报每处命中位置，**预告片片段组合**接口，在词区间
+互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合，
+以及**播放变速规划**接口，把连续同一说话人的词合并为语速块，在目标最长
+播放时长约束下选出总变速代价最小的语速方案。
 基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
@@ -26,6 +28,7 @@ docker compose up --build
 - 重复口播片段接口：`POST http://localhost:8000/duplicate-passages`
 - 敏感短语遮罩预览接口：`POST http://localhost:8000/redact-preview`
 - 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
+- 播放变速规划接口：`POST http://localhost:8000/playback-plan`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -669,13 +672,139 @@ curl -s http://localhost:8000/trailer-plan \
 }
 ```
 
+## 播放变速规划：`POST /playback-plan`
+
+把**连续同一说话人**的词合并为语速块（至多 **20** 块），为每块从
+**100% / 125% / 150%** 中选一种语速：块内自首词 `start_ms` 至末词 `end_ms`
+整段变速，**块间静音保持原时长**。在总播放时长不超 `max_duration_ms` 的
+约束下，选出总变速代价最小的语速方案。`words` 字段与 `/segments` 相同，
+并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/playback-plan`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 1000, "text": "开场白",   "speaker": "A"},
+    {"start_ms": 1000, "end_ms": 2000, "text": "欢迎收听", "speaker": "A"},
+    {"start_ms": 3000, "end_ms": 4000, "text": "今天聊聊", "speaker": "B"},
+    {"start_ms": 4000, "end_ms": 5000, "text": "动态规划", "speaker": "B"},
+    {"start_ms": 5500, "end_ms": 6500, "text": "下期再见", "speaker": "A"}
+  ],
+  "max_duration_ms": 5700
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `max_duration_ms` | 非负整数 | 目标最长播放时长（毫秒）：各块播放时长与块间静音之和不得超过它 |
+
+### 变速规则
+
+1. **语速块**：连续同一说话人的词合成一块，块数为说话人连续区间数，至多
+   **20** 块，超限返回 422（`too_many_blocks`）；块原始时长为
+   末词 `end_ms` 减首词 `start_ms`（块内词间静音一并变速）；
+2. **播放时长**：每块整段变速，播放时长为 `ceil(原时长 × 100 / 语速)`；
+   块间静音（前块末词 `end_ms` 到后块首词 `start_ms`）保持原时长；
+   播放时间轴从 0 起按块播放时长与块间静音依次累加；
+3. **约束**：总播放时长（各块播放时长 + 块间静音）`<= max_duration_ms`；
+4. **目标**：最小化总变速代价 `Σ 原时长 × (语速 - 100)²`；同代价取
+   **总播放时长最长**者，再取**语速序列字典序最小**者（100 < 125 < 150）；
+5. 全部块取 150% 仍超时（或块间静音本身已超目标）时返回 **422**
+   （`infeasible_playback_plan`）。
+
+### 响应示例（200）
+
+```json
+{
+  "blocks": [
+    {
+      "index": 0,
+      "start_word": 0,
+      "end_word": 1,
+      "speaker": "A",
+      "source_start_ms": 0,
+      "source_end_ms": 2000,
+      "duration_ms": 2000,
+      "speed": 125,
+      "playback_duration_ms": 1600,
+      "playback_start_ms": 0,
+      "playback_end_ms": 1600
+    },
+    {
+      "index": 1,
+      "start_word": 2,
+      "end_word": 3,
+      "speaker": "B",
+      "source_start_ms": 3000,
+      "source_end_ms": 5000,
+      "duration_ms": 2000,
+      "speed": 125,
+      "playback_duration_ms": 1600,
+      "playback_start_ms": 2600,
+      "playback_end_ms": 4200
+    },
+    {
+      "index": 2,
+      "start_word": 4,
+      "end_word": 4,
+      "speaker": "A",
+      "source_start_ms": 5500,
+      "source_end_ms": 6500,
+      "duration_ms": 1000,
+      "speed": 100,
+      "playback_duration_ms": 1000,
+      "playback_start_ms": 4700,
+      "playback_end_ms": 5700
+    }
+  ],
+  "total_cost": 2500000,
+  "total_duration_ms": 5700
+}
+```
+
+> `blocks` 按时间升序返回，`index` 为 0-based 块序号，`start_word` / `end_word`
+> 为 0-based、含端点的词序号。`source_start_ms`/`source_end_ms` 为块在原始
+> 时间轴上的起止（首词 `start_ms`、末词 `end_ms`）；`playback_start_ms`/
+> `playback_end_ms` 为播放时间轴上的起止——从 0 起按块播放时长与块间静音
+> 依次累加（上例块 0 播放 0～1600ms，静音 1000ms 后块 1 播放 2600～4200ms，
+> 再静音 500ms 后块 2 播放 4700～5700ms）。
+> 上例全部 100% 需 6500ms 超目标；(125, 125, 100) 的播放时长为
+> 1600+1600+1000=4200ms，加静音 1500ms 恰好 5700ms，代价
+> `2000×625 + 2000×625 + 0 = 2500000` 为可行方案中最小。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/playback-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":1000,"text":"开场白","speaker":"A"},{"start_ms":1000,"end_ms":2000,"text":"欢迎收听","speaker":"A"},{"start_ms":3000,"end_ms":4000,"text":"今天聊聊","speaker":"B"},{"start_ms":4000,"end_ms":5000,"text":"动态规划","speaker":"B"},{"start_ms":5500,"end_ms":6500,"text":"下期再见","speaker":"A"}],"max_duration_ms":5700}'
+```
+
+### 无可行变速方案
+
+全部块取 150% 仍超过目标时长（或块间静音本身已超目标）时，返回 422：
+
+```json
+{
+  "error": {
+    "code": "infeasible_playback_plan",
+    "message": "不存在满足全部约束的播放变速方案",
+    "block_count": 3,
+    "max_duration_ms": 4834
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串、`max_duration_ms` 为负） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -689,6 +818,8 @@ curl -s http://localhost:8000/trailer-plan \
 | `candidate_range_inverted` | 预告片候选 `start_word > end_word` | `candidate_index` |
 | `candidate_speaker_mixed` | 预告片候选词区间横跨多个说话人 | `candidate_index` |
 | `infeasible_trailer_plan` | 不存在满足全部约束的预告片片段组合 | `candidate_count`、`budget_ms` |
+| `too_many_blocks` | 同一说话人连续块数超过 20 | `block_count` |
+| `infeasible_playback_plan` | 不存在满足目标最长播放时长约束的变速方案 | `block_count`、`max_duration_ms` |
 
 ### 无可行分段
 
@@ -780,6 +911,19 @@ O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符�
 被选候选，余项恰落在下一状态前沿内即可行，每步取原候选序号最小者，归纳可得
 时间顺序候选序号序列的字典序最小者。
 
+播放变速规划（`playback_plan.py`）为折半枚举（meet-in-the-middle），
+**O(3^(m/2)·m) 时间/空间**（m 为语速块数 ≤ 20，m = 20 时约 12 万个组合）。
+每块仅 3 种语速，但块时长为任意整数时 `(播放时长, 代价)` 的帕累托前沿会
+指数膨胀（归并剪枝几乎不生效），直接对块做 DP 不可行，故把块序列对半分开：
+每种组合用三进制编码记录语速选择（编码大小顺序与语速序列字典序一致）；
+右半枚举全部 `(播放时长, 代价, 编码)`，按 `(时长, 编码)` 排序后扫出每个
+前缀的最优右半（代价最小、同代价时长最长、再同取编码最小）；左半按语速
+序列字典序枚举，用二分在右半中找到时长不超剩余预算的前缀最优并合并，
+全局按 `(总代价, -总时长)` 取最小且严格更优才替换——打平时先枚举到的
+左半序列字典序更小，同一左半下右半又已取字典序最小，故最终结果即字典序
+最小的语速序列。全部块取 150% 仍超时（或块间静音本身已超目标）即无可行
+方案。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -808,6 +952,7 @@ app/
   duplicate_passages.py # 重复口播片段检测（纯标准库，复用同一套输入校验）
   redact_preview.py     # 敏感短语遮罩预览（纯标准库，复用同一套输入校验）
   trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
+  playback_plan.py      # 播放变速规划（纯标准库，复用同一套输入校验）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -818,6 +963,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_duplicate_passages.py
   test_redact_preview.py
   test_trailer_plan.py
+  test_playback_plan.py
   test_differential.py
   test_api.py
 Dockerfile

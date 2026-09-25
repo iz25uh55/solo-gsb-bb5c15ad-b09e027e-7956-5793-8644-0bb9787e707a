@@ -759,5 +759,129 @@ class TrailerPlanApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class PlaybackPlanApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 1000, "text": "开场白", "speaker": "A"},
+        {"start_ms": 1000, "end_ms": 2000, "text": "欢迎收听", "speaker": "A"},
+        {"start_ms": 3000, "end_ms": 4000, "text": "今天聊聊", "speaker": "B"},
+        {"start_ms": 4000, "end_ms": 5000, "text": "动态规划", "speaker": "B"},
+        {"start_ms": 5500, "end_ms": 6500, "text": "下期再见", "speaker": "A"},
+    ]
+    # 块：A 2000ms、B 2000ms、A 1000ms；块间静音 1000ms 与 500ms
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {"words": self.WORDS, "max_duration_ms": 5700}
+        payload.update(overrides)
+        return self.client.post("/playback-plan", json=payload)
+
+    def test_basic_playback_plan(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["total_cost"], 2_500_000)
+        self.assertEqual(data["total_duration_ms"], 5700)
+        self.assertEqual(
+            data["blocks"],
+            [
+                {
+                    "index": 0,
+                    "start_word": 0,
+                    "end_word": 1,
+                    "speaker": "A",
+                    "source_start_ms": 0,
+                    "source_end_ms": 2000,
+                    "duration_ms": 2000,
+                    "speed": 125,
+                    "playback_duration_ms": 1600,
+                    "playback_start_ms": 0,
+                    "playback_end_ms": 1600,
+                },
+                {
+                    "index": 1,
+                    "start_word": 2,
+                    "end_word": 3,
+                    "speaker": "B",
+                    "source_start_ms": 3000,
+                    "source_end_ms": 5000,
+                    "duration_ms": 2000,
+                    "speed": 125,
+                    "playback_duration_ms": 1600,
+                    "playback_start_ms": 2600,
+                    "playback_end_ms": 4200,
+                },
+                {
+                    "index": 2,
+                    "start_word": 4,
+                    "end_word": 4,
+                    "speaker": "A",
+                    "source_start_ms": 5500,
+                    "source_end_ms": 6500,
+                    "duration_ms": 1000,
+                    "speed": 100,
+                    "playback_duration_ms": 1000,
+                    "playback_start_ms": 4700,
+                    "playback_end_ms": 5700,
+                },
+            ],
+        )
+
+    def test_infeasible_returns_422(self):
+        resp = self.post(max_duration_ms=4834)  # 全 150% 也需 4835ms
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_playback_plan")
+        self.assertEqual(err["block_count"], 3)
+        self.assertEqual(err["max_duration_ms"], 4834)
+        # 放宽到 4835 即可行
+        resp = self.post(max_duration_ms=4835)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()["total_duration_ms"], 4835)
+
+    def test_too_many_blocks(self):
+        words = [
+            {
+                "start_ms": i * 500,
+                "end_ms": i * 500 + 400,
+                "text": "词",
+                "speaker": "AB"[i % 2],
+            }
+            for i in range(21)
+        ]
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "too_many_blocks")
+        self.assertEqual(err["block_count"], 21)
+        # 20 块恰好在上限内
+        resp = self.post(words=words[:20])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()["blocks"]), 20)
+
+    def test_max_duration_schema(self):
+        for bad in (-1, None):
+            resp = self.post(max_duration_ms=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+        # 缺省 max_duration_ms
+        resp = self.client.post("/playback-plan", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()
